@@ -26,6 +26,7 @@ limitations under the License.
 #include "tensorflow/core/framework/tensor.pb.h"
 #include "tensorflow/core/graph/algorithm.h"
 #include "tensorflow/core/graph/control_flow.h"
+#include "tensorflow/core/graph/graph_node_util.h"
 #include "tensorflow/core/graph/tensor_id.h"
 #include "tensorflow/core/lib/hash/hash.h"
 
@@ -96,7 +97,7 @@ limitations under the License.
 // Symbolic > NonSymbolic.  The lattice has height = 2 so two iterations are
 // sufficient to converge.
 //
-// We first do an optimisitc analysis and, if it does not converge, we then fall
+// We first do an optimistic analysis and, if it does not converge, we then fall
 // back to a pessimistic analysis.  The optimistic analysis assigns the same
 // symbolic predicate to all the merge nodes whose preceding enter nodes have
 // the same frame name on the first iteration.  On the second iteration, if all
@@ -120,7 +121,7 @@ using se::port::StatusOr;
 // above.
 class Predicate {
  public:
-  enum class Kind { kAnd, kOr, kNot, kAndRecurrence, kSymbol };
+  enum class Kind { kAnd, kOr, kNot, kAndRecurrence, kSymbol, kIntSymbol };
 
   virtual string ToString() const = 0;
 
@@ -305,6 +306,45 @@ class SymbolPredicate : public Predicate {
   bool must_be_true_;
 };
 
+// Represents an uninterpreted symbol in a logical predicate.
+//
+// Two predicates are equivalent iff they are equivalent for all assignments to
+// the symbols contained in them, i.e. predicates are forall qualified over
+// symbols.
+class IntSymbolPredicate : public Predicate {
+ public:
+  explicit IntSymbolPredicate(int64 id, TensorId tensor_id,
+                              absl::optional<int> must_have_value)
+      : Predicate(id),
+        tensor_id_(std::move(tensor_id)),
+        must_have_value_(must_have_value) {}
+
+  string ToString() const override {
+    return must_have_value().has_value()
+               ? absl::StrCat(tensor_id_.ToString(), "=", *must_have_value_)
+               : tensor_id_.ToString();
+  }
+
+  Kind kind() const override { return Kind::kIntSymbol; }
+  absl::Span<Predicate* const> GetOperands() const override { return {}; }
+
+  // If `must_have_value().has_value()` is true, then this IntSymbolPredicate
+  // represents the proposition "tensor_id() is live and evaluates to
+  // `*must_have_value()`".
+  //
+  // If `must_have_value().has_value()` is false, then this IntSymbolPredicate
+  // represents the proposition "tensor_id() is live (and may evaluate to any
+  // value)".
+  TensorId tensor_id() const { return tensor_id_; }
+  const absl::optional<int>& must_have_value() const {
+    return must_have_value_;
+  }
+
+ private:
+  TensorId tensor_id_;
+  absl::optional<int> must_have_value_;
+};
+
 template <typename FunctionTy>
 /*static*/ void Predicate::Visit(Predicate* p, const FunctionTy& func) {
   absl::flat_hash_set<Predicate*> visited;
@@ -410,6 +450,40 @@ class PredicateFactory {
     return Status::OK();
   }
 
+  Status MakeSymbolPredicate(Node* node, int output_idx,
+                             absl::optional<int> must_have_value,
+                             Predicate** predicate) {
+    TensorId tensor_id(node->name(), output_idx);
+
+    TF_RET_CHECK(BaseType(node->output_type(tensor_id.index())) == DT_INT32);
+
+    if (must_have_value.has_value() && node->type_string() == "Const") {
+      const TensorProto* proto = nullptr;
+      TF_RETURN_IF_ERROR(GetNodeAttr(node->def(), "value", &proto));
+
+      Tensor tensor(proto->dtype());
+      TF_RET_CHECK(tensor.FromProto(*proto));
+
+      *predicate = tensor.scalar<int32>()() == *must_have_value ? MakeTrue()
+                                                                : MakeFalse();
+      return Status::OK();
+    }
+    SignatureForIntSymbol signature = {tensor_id, must_have_value};
+    auto it = interned_int_symbol_instances_.find(signature);
+    if (it == interned_int_symbol_instances_.end()) {
+      std::unique_ptr<Predicate> new_pred =
+          Make<IntSymbolPredicate>(tensor_id, must_have_value);
+      Predicate* new_pred_ptr = new_pred.get();
+      interned_int_symbol_instances_.emplace(std::move(signature),
+                                             std::move(new_pred));
+      *predicate = new_pred_ptr;
+    } else {
+      *predicate = it->second.get();
+    }
+
+    return Status::OK();
+  }
+
   Predicate* MakeTrue() { return MakeAndPredicate({}); }
   Predicate* MakeFalse() { return MakeOrPredicate({}); }
 
@@ -488,6 +562,7 @@ class PredicateFactory {
   using SignatureForAndRec =
       std::tuple<Predicate*, Predicate*, std::vector<string>>;
   using SignatureForSymbol = std::pair<SafeTensorId, bool>;
+  using SignatureForIntSymbol = std::pair<SafeTensorId, absl::optional<int32>>;
 
   struct HashSignatureForAndOr {
     size_t operator()(const SignatureForAndOr& signature) const {
@@ -503,6 +578,17 @@ class PredicateFactory {
     size_t operator()(const SignatureForSymbol& signature) const {
       return Hash64Combine(SafeTensorId::Hasher()(signature.first),
                            ::tensorflow::hash<bool>()(signature.second));
+    }
+  };
+
+  struct HashSignatureForIntSymbol {
+    size_t operator()(const SignatureForIntSymbol& signature) const {
+      return Hash64Combine(
+          SafeTensorId::Hasher()(signature.first),
+          Hash64Combine(
+              ::tensorflow::hash<bool>()(signature.second.has_value()),
+              ::tensorflow::hash<int32>()(
+                  signature.second.has_value() ? *signature.second : 0)));
     }
   };
 
@@ -546,6 +632,9 @@ class PredicateFactory {
   absl::flat_hash_map<SignatureForSymbol, std::unique_ptr<Predicate>,
                       HashSignatureForSymbol>
       interned_symbol_instances_;
+  absl::flat_hash_map<SignatureForIntSymbol, std::unique_ptr<Predicate>,
+                      HashSignatureForIntSymbol>
+      interned_int_symbol_instances_;
   int64 id_counter_ = 0;
   int stack_depth_ = 0;
 };
@@ -846,24 +935,43 @@ Status DeadnessAnalysisImpl::HandleSwitch(Node* n,
   const Edge* pred_edge;
   TF_RETURN_IF_ERROR(n->input_edge(1, &pred_edge));
 
-  Predicate* true_switch;
-  TF_RETURN_IF_ERROR(predicate_factory_.MakeSymbolPredicate(
-      pred_edge->src(), pred_edge->src_output(),
-      /*must_be_true=*/true, &true_switch));
+  if (n->type_string() != "_SwitchN") {  // bool pred branch selector.
+    Predicate* true_switch;
+    TF_RETURN_IF_ERROR(predicate_factory_.MakeSymbolPredicate(
+        pred_edge->src(), pred_edge->src_output(),
+        /*must_be_true=*/true, &true_switch));
 
-  Predicate* false_switch = predicate_factory_.MakeNotPredicate(true_switch);
+    Predicate* false_switch = predicate_factory_.MakeNotPredicate(true_switch);
 
-  // Output 0 is alive iff all inputs are alive and the condition is false.
-  input_preds.push_back(false_switch);
-  SetPredicate(n, 0, predicate_factory_.MakeAndPredicate(input_preds),
-               should_revisit);
-  input_preds.pop_back();
+    // Output 0 is alive iff all inputs are alive and the condition is false.
+    input_preds.push_back(false_switch);
+    SetPredicate(n, 0, predicate_factory_.MakeAndPredicate(input_preds),
+                 should_revisit);
+    input_preds.pop_back();
 
-  // Output 1 is alive iff all inputs are alive and the condition is true.
-  input_preds.push_back(true_switch);
-  SetPredicate(n, 1, predicate_factory_.MakeAndPredicate(input_preds),
-               should_revisit);
-  input_preds.pop_back();
+    // Output 1 is alive iff all inputs are alive and the condition is true.
+    input_preds.push_back(true_switch);
+    SetPredicate(n, 1, predicate_factory_.MakeAndPredicate(input_preds),
+                 should_revisit);
+    input_preds.pop_back();
+  } else {  // N-way switch case. Exactly one of N branches is alive.
+    Predicate* branch_pred;
+    for (int i = 0; i < n->num_outputs() - 1; i++) {
+      TF_RETURN_IF_ERROR(predicate_factory_.MakeSymbolPredicate(
+          pred_edge->src(), pred_edge->src_output(),
+          /*must_have_value=*/absl::optional<int32>(i), &branch_pred));
+      input_preds.push_back(branch_pred);
+      SetPredicate(n, i, predicate_factory_.MakeAndPredicate(input_preds),
+                   should_revisit);
+      input_preds.pop_back();
+      input_preds.push_back(predicate_factory_.MakeNotPredicate(branch_pred));
+    }
+    // The default (last) branch does not need its own symbol, is simply the
+    // nor of all other branches.
+    SetPredicate(n, n->num_outputs() - 1,
+                 predicate_factory_.MakeAndPredicate(input_preds),
+                 should_revisit);
+  }
 
   // Control is alive iff all inputs are alive.
   SetPredicate(n, Graph::kControlSlot,
@@ -1148,7 +1256,7 @@ Status DeadnessAnalysisImpl::GetFrameBasedTopologicalOrder(
     } else if (IsRootExit(node)) {
       ++num_exits_for_frame[cf.frame_name];
     }
-    // Edge NextIteration->Merge is counted before starting the traveral to
+    // Edge NextIteration->Merge is counted before starting the traversal to
     // break the backedges.
     if (IsMerge(node)) {
       for (const Edge* e : node->in_edges()) {
@@ -1351,11 +1459,11 @@ Status DeadnessAnalysisImpl::PopulateFrame(absl::Span<Node* const> topo,
 
   for (Node* n : topo) {
     // The nodes added to should_revisit in the previous loop need to be
-    // revisited now.  Reprocesing these initial nodes may add *their* consumers
-    // to should_revisit, and these newly added nodes will also be processed by
-    // this very same loop.  Since we're traversing the graph in topological
-    // order (producers before consumers) and HandleNode(n) can only ever add
-    // n's consumers to should_revisit, we won't "miss" an addition to
+    // revisited now.  Reprocessing these initial nodes may add *their*
+    // consumers to should_revisit, and these newly added nodes will also be
+    // processed by this very same loop.  Since we're traversing the graph in
+    // topological order (producers before consumers) and HandleNode(n) can only
+    // ever add n's consumers to should_revisit, we won't "miss" an addition to
     // should_revisit.
     if (should_revisit[n->id()]) {
       VLOG(4) << "Revisiting " << n->name();
@@ -1476,7 +1584,6 @@ DeadnessAnalysis::~DeadnessAnalysis() {}
 absl::flat_hash_map<TensorId, string, TensorId::Hasher>
 DeadnessAnalysisImpl::PredicateMapAsString() const {
   absl::flat_hash_map<TensorId, string, TensorId::Hasher> result;
-  std::vector<TensorId> tensor_ids;
   for (const auto& kv_pair : predicate_map_) {
     CHECK(result.insert({kv_pair.first, kv_pair.second->ToString()}).second);
   }

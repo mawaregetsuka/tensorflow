@@ -14,10 +14,17 @@ limitations under the License.
 ==============================================================================*/
 #include "tensorflow/lite/delegates/nnapi/nnapi_delegate.h"
 
+#include <sys/mman.h>
+
+#include <initializer_list>
+
 #include <gtest/gtest.h>
+#include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/kernels/test_util.h"
 #include "tensorflow/lite/model.h"
+#include "tensorflow/lite/nnapi/NeuralNetworksTypes.h"
+#include "tensorflow/lite/nnapi/nnapi_implementation.h"
 
 namespace tflite {
 namespace {
@@ -41,24 +48,31 @@ MATCHER(QuantizedNear, "") {
 class SingleOpModelWithNNAPI : public SingleOpModel {
  public:
   SingleOpModelWithNNAPI() {
-    this->SetApplyDelegate([](Interpreter* interpreter) {
-      interpreter->ModifyGraphWithDelegate(NnApiDelegate());
-    });
+    options_.disallow_nnapi_cpu = false;
+    stateful_delegate_.reset(new StatefulNnApiDelegate(options_));
+    SetDelegate(stateful_delegate_.get());
   }
 
   explicit SingleOpModelWithNNAPI(
       const StatefulNnApiDelegate::Options& options) {
-    stateful_delegate_.reset(new StatefulNnApiDelegate(options));
-    auto* delegate = stateful_delegate_.get();
-    this->SetApplyDelegate([delegate](Interpreter* interpreter) {
-      interpreter->ModifyGraphWithDelegate(delegate);
-    });
+    options_ = options;
+    options_.disallow_nnapi_cpu = false;
+    stateful_delegate_.reset(new StatefulNnApiDelegate(options_));
+    SetDelegate(stateful_delegate_.get());
   }
 
   TfLiteStatus ResizeInputTensor(int tensor_index,
                                  const std::vector<int>& dims) {
     return interpreter_->ResizeInputTensor(tensor_index, dims);
   }
+
+  StatefulNnApiDelegate* GetDelegate() { return stateful_delegate_.get(); }
+
+  void SetBufferHandle(int index, TfLiteBufferHandle handle) {
+    interpreter_->SetBufferHandle(index, handle, stateful_delegate_.get());
+  }
+
+  TfLiteStatus AllocateTensors() { return interpreter_->AllocateTensors(); }
 
  protected:
   void SetData(int index, TensorType type, const std::vector<float>& data) {
@@ -99,6 +113,7 @@ class SingleOpModelWithNNAPI : public SingleOpModel {
  private:
   // Stateful NNAPI delegate. This is valid only if the state-ful constructor is
   // used.
+  StatefulNnApiDelegate::Options options_;
   std::unique_ptr<StatefulNnApiDelegate> stateful_delegate_;
 };
 
@@ -140,8 +155,8 @@ class FloatAddOpModel : public SingleOpModelWithNNAPI {
     output_ = AddOutput(output);
     SetBuiltinOp(BuiltinOperator_ADD, BuiltinOptions_AddOptions,
                  CreateAddOptions(builder_, activation_type).Union());
-    BuildInterpreter({GetShape(input1_), GetShape(input2_)},
-                     allow_fp32_relax_to_fp16);
+    BuildInterpreter({GetShape(input1_), GetShape(input2_)}, /*num_threads=*/-1,
+                     allow_fp32_relax_to_fp16, /*apply_delegate=*/true);
   }
 };
 
@@ -191,15 +206,77 @@ TEST(NNAPIDelegate, AddWithRelu) {
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({0.0, 0.4, 1.0, 1.3}));
 }
 
-// Verify that resize attempts fail.
-// TODO(b/113110851): Verify success after the delegate supports resizing.
-TEST(NNAPIDelegate, ResizeFails) {
+// Verify that resize attempts succeed.
+TEST(NNAPIDelegate, ResizeInputTensorsWorks) {
   FloatAddOpModel m({TensorType_FLOAT32, {1, 2, 2, 1}},
                     {TensorType_FLOAT32, {1, 2, 2, 1}},
                     {TensorType_FLOAT32, {}}, ActivationFunctionType_NONE);
-  m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8});
-  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
-  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 3, 3, 1}), kTfLiteError);
+
+  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 3, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 3, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8, 0.9, 0.7});
+  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5, 0.2, 0.8});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3, 1.1, 1.5}));
+
+  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 2, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 2, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  m.PopulateTensor<float>(m.input1(), {0.7, 0.8, 0.9, 0.7});
+  m.PopulateTensor<float>(m.input2(), {0.3, 0.5, 0.2, 0.8});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({1.0, 1.3, 1.1, 1.5}));
+}
+
+TEST(NNAPIDelegate, ResizeDynamicBatchInputTensorsWorks) {
+  StatefulNnApiDelegate::Options options;
+  options.allow_dynamic_dimensions = true;
+
+  FloatAddOpModel m(options,
+                    {TensorType_FLOAT32, /*shape=*/{1, 3, 2, 1}, /*min=*/0.0f,
+                     /*max=*/0.0f, /*scale=*/0.0f,
+                     /*zero_point=*/0, /*per_channel_quantization=*/false,
+                     /*per_channel_quantization_scales=*/{},
+                     /*per_channel_quantization_offsets=*/{},
+                     /*channel_index=*/0, /*traversal_order=*/{},
+                     /*format=*/{},
+                     /*block_size=*/{}, /*block_map=*/{},
+                     /*shape_signature=*/{1, -1, 2, 1}},
+                    {TensorType_FLOAT32, /*shape=*/{1, 3, 2, 1}, /*min=*/0.0f,
+                     /*max=*/0.0f, /*scale=*/0.0f,
+                     /*zero_point=*/0, /*per_channel_quantization=*/false,
+                     /*per_channel_quantization_scales=*/{},
+                     /*per_channel_quantization_offsets=*/{},
+                     /*channel_index=*/0, /*traversal_order=*/{},
+                     /*format=*/{},
+                     /*block_size=*/{}, /*block_map=*/{},
+                     /*shape_signature=*/{1, -1, 2, 1}},
+                    {TensorType_FLOAT32, /*shape=*/{}, /*min=*/0.0f,
+                     /*max=*/0.0f, /*scale=*/0.0f,
+                     /*zero_point=*/0, /*per_channel_quantization=*/false,
+                     /*per_channel_quantization_scales=*/{},
+                     /*per_channel_quantization_offsets=*/{},
+                     /*channel_index=*/0, /*traversal_order=*/{},
+                     /*format=*/{},
+                     /*block_size=*/{}, /*block_map=*/{},
+                     /*shape_signature=*/{1, -1, 2, 1}},
+                    ActivationFunctionType_NONE);
+  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 3, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 3, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8, 0.9, 0.7});
+  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5, 0.2, 0.8});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3, 1.1, 1.5}));
+
+  EXPECT_EQ(m.ResizeInputTensor(m.input1(), {1, 2, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.ResizeInputTensor(m.input2(), {1, 2, 2, 1}), kTfLiteOk);
+  EXPECT_EQ(m.AllocateTensors(), kTfLiteOk);
+  m.PopulateTensor<float>(m.input1(), {0.7, 0.8, 0.9, 0.7});
+  m.PopulateTensor<float>(m.input2(), {0.3, 0.5, 0.2, 0.8});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({1.0, 1.3, 1.1, 1.5}));
 }
 
 // Sanity check for the state-ful NNAPI delegate.
@@ -234,6 +311,32 @@ TEST(NNAPIDelegate, StatefulDelegateWithAcceleratorName) {
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3}));
 }
 
+// Sanity check for the state-ful NNAPI delegate with invalid accelerator_name
+// specified.
+TEST(NNAPIDelegate, StatefulDelegateWithInvalidAcceleratorName) {
+  if (!NnApiImplementation()->ANeuralNetworksDevice_getName) {
+    GTEST_SKIP();
+  }
+  testing::internal::CaptureStderr();
+  StatefulNnApiDelegate::Options options;
+  options.execution_preference =
+      StatefulNnApiDelegate::Options::ExecutionPreference::kLowPower;
+  options.accelerator_name = "foo";
+
+  FloatAddOpModel m(options, {TensorType_FLOAT32, {1, 2, 2, 1}},
+                    {TensorType_FLOAT32, {1, 2, 2, 1}},
+                    {TensorType_FLOAT32, {}}, ActivationFunctionType_NONE);
+  EXPECT_THAT(testing::internal::GetCapturedStderr(),
+              testing::HasSubstr(
+                  "Could not find the specified NNAPI accelerator: foo"));
+
+  // Execution should fall back to the default CPU path.
+  m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8});
+  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3}));
+}
+
 // Sanity check for the state-ful NNAPI delegate with compilation caching
 // enabled.
 TEST(NNAPIDelegate, StatefulDelegateWithCompilationCaching) {
@@ -250,6 +353,95 @@ TEST(NNAPIDelegate, StatefulDelegateWithCompilationCaching) {
   m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
   m.Invoke();
   EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3}));
+}
+
+// Sanity check for the state-ful NNAPI delegate with QoS hints.
+TEST(NNAPIDelegate, StatefulDelegateWithQoS) {
+  StatefulNnApiDelegate::Options options;
+  options.accelerator_name = "nnapi-reference";
+  options.execution_priority = ANEURALNETWORKS_PRIORITY_HIGH;
+  options.max_compilation_timeout_duration_ns = UINT64_MAX;
+  options.max_execution_timeout_duration_ns = UINT64_MAX;
+  options.max_execution_loop_timeout_duration_ns = UINT64_MAX;
+
+  FloatAddOpModel m(options, {TensorType_FLOAT32, {1, 2, 2, 1}},
+                    {TensorType_FLOAT32, {1, 2, 2, 1}},
+                    {TensorType_FLOAT32, {}}, ActivationFunctionType_NONE);
+  m.PopulateTensor<float>(m.input1(), {-2.0, 0.2, 0.7, 0.8});
+  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3}));
+}
+
+// Sanity check for the state-ful NNAPI delegate using TfLiteBufferHandle.
+TEST(NNAPIDelegate, StatefulDelegateWithBufferHandles) {
+  // Skip the test if Android specific functions could not be found.
+  if (!NnApiImplementation()->ASharedMemory_create ||
+      !NnApiImplementation()->ANeuralNetworksMemory_createFromFd) {
+    GTEST_SKIP();
+  }
+  StatefulNnApiDelegate::Options options;
+  FloatAddOpModel m(options, {TensorType_FLOAT32, {1, 2, 2, 1}},
+                    {TensorType_FLOAT32, {1, 2, 2, 1}},
+                    {TensorType_FLOAT32, {}}, ActivationFunctionType_NONE);
+  auto* delegate = m.GetDelegate();
+  // Create ASharedMemory and copy data into it.
+  constexpr auto kInput1ByteSize = 4 * sizeof(float);
+  ANeuralNetworksMemory* input1_memory = nullptr;
+  int fd =
+      NnApiImplementation()->ASharedMemory_create("input1", kInput1ByteSize);
+  EXPECT_GE(fd, 0);
+  void* input1_memory_data =
+      mmap(nullptr, kInput1ByteSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  EXPECT_TRUE(input1_memory_data != nullptr);
+  float input1_data[] = {-2.0, 0.2, 0.7, 0.8};
+  memcpy(input1_memory_data, input1_data, kInput1ByteSize);
+  int result = NnApiImplementation()->ANeuralNetworksMemory_createFromFd(
+      kInput1ByteSize, PROT_READ, fd, 0, &input1_memory);
+  EXPECT_EQ(result, ANEURALNETWORKS_NO_ERROR);
+  ASSERT_NE(input1_memory, nullptr);
+
+  struct DummyMemoryContext {
+    ANeuralNetworksMemory* memory_handle;
+    void* memory_data;
+    size_t byte_size;
+  };
+  DummyMemoryContext memory_context = {input1_memory, input1_memory_data,
+                                       kInput1ByteSize};
+  static StatefulNnApiDelegate::CopyToHostTensorFnPtr memory_callback =
+      [](TfLiteTensor* tensor, ANeuralNetworksMemory* memory,
+         size_t memory_offset, size_t byte_size,
+         void* callback_context) -> TfLiteStatus {
+    auto memory_context =
+        reinterpret_cast<DummyMemoryContext*>(callback_context);
+    if (memory != memory_context->memory_handle ||
+        memory_offset + byte_size > memory_context->byte_size) {
+      return kTfLiteError;
+    }
+    memcpy(
+        tensor->data.raw,
+        reinterpret_cast<uint8_t*>(memory_context->memory_data) + memory_offset,
+        byte_size);
+    return kTfLiteOk;
+  };
+  auto input1_handle = delegate->RegisterNnapiMemory(
+      input1_memory, memory_callback, &memory_context);
+  m.SetBufferHandle(m.input1(), input1_handle);
+  m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9, 0.4, 1.0, 1.3}));
+  // Run the inference multiple times and each time register a buffer.
+  for (int i = 0; i < 10; i++) {
+    // Change the value a little bit.
+    input1_data[0] = -2.0 + i;
+    memcpy(input1_memory_data, input1_data, kInput1ByteSize);
+    auto input1_handle = delegate->RegisterNnapiMemory(
+        input1_memory, memory_callback, &memory_context);
+    m.SetBufferHandle(m.input1(), input1_handle);
+    m.PopulateTensor<float>(m.input2(), {0.1, 0.2, 0.3, 0.5});
+    m.Invoke();
+    EXPECT_THAT(m.GetOutput(), ElementsAreArray({-1.9 + i, 0.4, 1.0, 1.3}));
+  }
 }
 
 class FloatMulOpModel : public SingleOpModelWithNNAPI {
@@ -710,6 +902,113 @@ TEST(ConvolutionOpTest, SimpleTestQuantizedWithDilation) {
   // | 5 | 5 | 5 |
   EXPECT_THAT(m.GetQuantizedOutput(),
               ElementsAreArray({5, 5, 5, 5, 5, 5, 5, 5, 5}));
+}
+
+class PerChannelQuantizedConvolutionWithConstantFilterOpModel
+    : public SingleOpModelWithNNAPI {
+ public:
+  PerChannelQuantizedConvolutionWithConstantFilterOpModel(
+      const TensorData& input, const TensorData& filter,
+      std::initializer_list<int8_t> filter_data,
+      std::initializer_list<int32_t> bias_data, const TensorData& output,
+      int stride_width = 2, int stride_height = 2,
+      enum Padding padding = Padding_VALID,
+      enum ActivationFunctionType activation = ActivationFunctionType_NONE,
+      int dilation_width_factor = 1, int dilation_height_factor = 1)
+      : input_type_(input.type), filter_type_(filter.type) {
+    CHECK(filter.per_channel_quantization);
+    input_ = AddInput(input);
+    filter_ = AddConstInput(filter, filter_data);
+
+    const int bias_size = GetShape(filter_)[0];
+    const int num_channels = filter.per_channel_quantization_scales.size();
+    const std::vector<int64_t> bias_offsets(num_channels, 0);
+    std::vector<float> bias_scales(num_channels);
+    for (int i = 0; i < num_channels; i++) {
+      bias_scales[i] = input.scale * filter.per_channel_quantization_scales[i];
+    }
+    const TensorData bias{TensorType_INT32,
+                          {bias_size},
+                          /*min=*/0,
+                          /*max=*/0,
+                          /*scale=*/0,
+                          /*zero_point=*/0,
+                          /*per_channel_quantization=*/true,
+                          /*per_channel_quantization_scales=*/bias_scales,
+                          /*per_channel_quantization_offsets=*/bias_offsets,
+                          /*channel_index==*/0};
+    bias_ = AddConstInput(bias, bias_data);
+
+    output_ = AddOutput(output);
+
+    SetBuiltinOp(BuiltinOperator_CONV_2D, BuiltinOptions_Conv2DOptions,
+                 CreateConv2DOptions(
+                     builder_, padding, stride_width, stride_height, activation,
+                     dilation_width_factor, dilation_height_factor)
+                     .Union());
+
+    BuildInterpreter({GetShape(input_), GetShape(filter_), GetShape(bias_)});
+  }
+
+  void SetInput(std::initializer_list<float> data) {
+    QuantizeAndPopulate<int8_t>(input_, data);
+  }
+
+  std::vector<int8_t> GetOutput() { return ExtractVector<int8_t>(output_); }
+
+ protected:
+  int input_;
+  int filter_;
+  int bias_;
+  int output_;
+
+  const TensorType input_type_;
+  const TensorType filter_type_;
+};
+
+TEST(ConvolutionOpTest, SimplePerChannelTest) {
+  PerChannelQuantizedConvolutionWithConstantFilterOpModel m(
+      {TensorType_INT8, {1, 2, 3, 2}, -63.5, 64, 0.5, -1},
+      {TensorType_INT8,
+       // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
+       {2, 2, 2, 2},
+       /*min=*/0,
+       /*max=*/0,
+       /*scale=*/0,
+       /*zero_point=*/0,
+       /*per_channel_quantization=*/true,
+       /*per_channel_quantization_scales=*/{1, 2},
+       /*per_channel_quantization_offsets=*/{0, 0},
+       /*channel_index=*/0},
+      /*filter_data=*/
+      {
+          // [2 * 2 * 2 * 2] as [output_channel, y, x, input_channel]
+          1, 2,  // out channel = 0, y = 0, x = 0
+          3, 4,  // out channel = 0, y = 0, x = 1
+          3, 4,  // out channel = 0, y = 1, x = 0
+          5, 6,  // out channel = 0, y = 1, x = 1
+          4, 4,  // out channel = 1, y = 0, x = 0
+          3, 3,  // out channel = 1, y = 0, x = 1
+          2, 2,  // out channel = 1, y = 1, x = 0
+          1, 1,  // out channel = 1, y = 1, x = 1
+      },
+      /*bias_data=*/{6, -2}, {TensorType_INT8, {}, -63.5, 64, 0.5, -1},
+      /*stride_width=*/1, /*stride_height=*/1);
+  m.SetInput({
+      // [1 * 2 * 3 * 2] as [batch, y, x, input_channel]
+      3, 2,    // batch = 0, y = 0, x = 0
+      1, -1,   // batch = 0, y = 0, x = 1
+      -2, -3,  // batch = 0, y = 0, x = 2
+      4, 3,    // batch = 0, y = 1, x = 0
+      2, -2,   // batch = 0, y = 1, x = 1
+      -3, -4,  // batch = 0, y = 1, x = 2
+  });
+
+  // Invoke and verify output.
+  // output has dimension [1 * 1 * 2 * 2] as [batch, y, x, output_channel]
+  m.Invoke();
+  EXPECT_THAT(m.GetOutput(),
+              testing::Pointwise(QuantizedNear(), {61, 127, -115, -93}));
 }
 
 class DepthwiseConvolutionOpModel : public SingleOpModelWithNNAPI {
@@ -1772,7 +2071,7 @@ class BaseActivationsOpModel : public SingleOpModelWithNNAPI {
  public:
   // Most activations don't take any options, so this constructor works for
   // them.
-  BaseActivationsOpModel(BuiltinOperator type, TensorData input) {
+  BaseActivationsOpModel(BuiltinOperator type, const TensorData& input) {
     input_ = AddInput(input);
     if (input.type == TensorType_UINT8) {
       output_ = AddOutput({input.type, {}, 0, 0, 1. / 256});
@@ -1868,20 +2167,6 @@ TEST(NNAPIDelegate, Relu6) {
                                  0, 0, 2, 4,  //
                                  3, 0, 6, 1,  //
                              }));
-}
-
-TEST(NNAPIDelegate, Tanh) {
-  FloatActivationsOpModel m(BuiltinOperator_TANH,
-                            /*input=*/{TensorType_FLOAT32, {1, 2, 4, 1}});
-  m.SetInput({
-      0, -6, 2, 4,   //
-      3, -2, 10, 1,  //
-  });
-  m.Invoke();
-  EXPECT_THAT(m.GetOutput(), ElementsAreArray(ArrayFloatNear({
-                                 0, -0.9999877, 0.9640275, 0.999329,    //
-                                 0.99505475, -0.9640275, 1, 0.7615941,  //
-                             })));
 }
 
 TEST(NNAPIDelegate, LogisticFloat) {
@@ -2404,7 +2689,7 @@ class RNNOpModel : public SingleOpModelWithNNAPI {
     weights_ = AddInput(weights);
     recurrent_weights_ = AddInput(recurrent_weights);
     bias_ = AddInput(TensorType_FLOAT32);
-    hidden_state_ = AddInput(TensorType_FLOAT32, true);
+    hidden_state_ = AddVariableInput(TensorType_FLOAT32);
     output_ = AddOutput(TensorType_FLOAT32);
     SetBuiltinOp(
         BuiltinOperator_RNN, BuiltinOptions_RNNOptions,
@@ -2594,9 +2879,8 @@ class BaseSVDFOpModel : public SingleOpModelWithNNAPI {
     // when using NNAPI delegate.
     bias_ = AddInput(TensorType_FLOAT32);
     const int num_filters = units * rank;
-    activation_state_ = AddInput(
-        TensorData{TensorType_FLOAT32, {batches, memory_size * num_filters}},
-        /*is_variable=*/true);
+    activation_state_ = AddVariableInput(
+        TensorData{TensorType_FLOAT32, {batches, memory_size * num_filters}});
     output_ = AddOutput(TensorType_FLOAT32);
     SetBuiltinOp(
         BuiltinOperator_SVDF, BuiltinOptions_SVDFOptions,
@@ -2820,8 +3104,8 @@ class LSTMOpModel : public SingleOpModelWithNNAPI {
     }
 
     // Adding the 2 input state tensors.
-    input_activation_state_ = AddInput(TensorType_FLOAT32, true);
-    input_cell_state_ = AddInput(TensorType_FLOAT32, true);
+    input_activation_state_ = AddVariableInput(TensorType_FLOAT32);
+    input_cell_state_ = AddVariableInput(TensorType_FLOAT32);
 
     const bool use_layer_norm = input_shapes.size() > 20;
     // Layer norm weights.
@@ -2922,19 +3206,19 @@ class LSTMOpModel : public SingleOpModelWithNNAPI {
     PopulateTensor(projection_bias_, f);
   }
 
-  void SetInputLayerNormCoefficients(std::vector<float> f) {
+  void SetInputLayerNormCoefficients(const std::vector<float>& f) {
     PopulateTensor(input_layer_norm_coefficients_, f);
   }
 
-  void SetForgetLayerNormCoefficients(std::vector<float> f) {
+  void SetForgetLayerNormCoefficients(const std::vector<float>& f) {
     PopulateTensor(forget_layer_norm_coefficients_, f);
   }
 
-  void SetCellLayerNormCoefficients(std::vector<float> f) {
+  void SetCellLayerNormCoefficients(const std::vector<float>& f) {
     PopulateTensor(cell_layer_norm_coefficients_, f);
   }
 
-  void SetOutputLayerNormCoefficients(std::vector<float> f) {
+  void SetOutputLayerNormCoefficients(const std::vector<float>& f) {
     PopulateTensor(output_layer_norm_coefficients_, f);
   }
 
@@ -4341,6 +4625,35 @@ class BaseReduceOpModel : public SingleOpModelWithNNAPI {
   int output_;
 };
 
+// Model for the tests case where axis is a dynamic tensor.
+class MeanOpDynamicModel : public BaseReduceOpModel {
+ public:
+  MeanOpDynamicModel(const TensorData& input, const TensorData& output,
+                     const TensorData& axis, bool keep_dims) {
+    input_ = AddInput(input);
+    axis_ = AddInput(axis);
+    output_ = AddOutput(output);
+    SetBuiltinOp(BuiltinOperator_MEAN, BuiltinOptions_ReducerOptions,
+                 CreateReducerOptions(builder_, keep_dims).Union());
+    BuildInterpreter({GetShape(input_)});
+  }
+};
+
+TEST(DynamicFloatMeanOpTest, NotKeepDims) {
+  std::vector<float> data = {1.0,  2.0,  3.0,  4.0,  5.0,  6.0,  7.0,  8.0,
+                             9.0,  10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+                             17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0};
+  MeanOpDynamicModel m({TensorType_FLOAT32, {4, 3, 2}},
+                       {TensorType_FLOAT32, {2}}, {TensorType_INT32, {4}},
+                       false);
+  std::vector<int> axis = {1, 0, -3, -3};
+  m.SetAxis(axis);
+  m.SetInput(data);
+  m.Invoke();
+  EXPECT_THAT(m.GetOutputShape(), ElementsAreArray({2}));
+  EXPECT_THAT(m.GetOutput<float>(), ElementsAreArray(ArrayFloatNear({12, 13})));
+}
+
 // Model for the tests case where axis is a const tensor.
 class MeanOpConstModel : public BaseReduceOpModel {
  public:
@@ -4673,17 +4986,17 @@ class PadV2OpConstModel : public PadOpModel<T1> {
 };
 
 // Test case where paddings is a non-const tensor.
-template <typename RegularInputOuput>
-class PadV2OpDynamicModel : public PadOpModel<RegularInputOuput> {
+template <typename RegularInputOutput>
+class PadV2OpDynamicModel : public PadOpModel<RegularInputOutput> {
  public:
   PadV2OpDynamicModel(const TensorData& input,
                       std::initializer_list<int> paddings_shape,
-                      RegularInputOuput constant_values,
+                      RegularInputOutput constant_values,
                       const TensorData& output) {
     this->input_ = this->AddInput(input);
     this->paddings_ = this->AddInput(TensorType_INT32);
     this->constant_values_ = this->AddConstInput(
-        GetTensorType<RegularInputOuput>(), {constant_values}, {1});
+        GetTensorType<RegularInputOutput>(), {constant_values}, {1});
     this->output_ = this->AddOutput(output);
 
     this->SetBuiltinOp(BuiltinOperator_PADV2, BuiltinOptions_PadV2Options,

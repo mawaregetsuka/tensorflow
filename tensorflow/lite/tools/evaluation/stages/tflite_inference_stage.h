@@ -20,10 +20,11 @@ limitations under the License.
 #include <vector>
 
 #include "tensorflow/core/util/stats_calculator.h"
-#include "tensorflow/lite/c/c_api_internal.h"
+#include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/interpreter.h"
 #include "tensorflow/lite/kernels/register.h"
 #include "tensorflow/lite/model.h"
+#include "tensorflow/lite/tools/evaluation/evaluation_delegate_provider.h"
 #include "tensorflow/lite/tools/evaluation/evaluation_stage.h"
 #include "tensorflow/lite/tools/evaluation/proto/evaluation_config.pb.h"
 
@@ -41,14 +42,15 @@ class TfliteInferenceStage : public EvaluationStage {
   explicit TfliteInferenceStage(const EvaluationStageConfig& config)
       : EvaluationStage(config) {}
 
-  TfLiteStatus Init() override;
+  TfLiteStatus Init() override { return Init(nullptr); }
+  TfLiteStatus Init(const DelegateProviders* delegate_providers);
 
   TfLiteStatus Run() override;
 
   // EvaluationStageMetrics.num_runs denotes the number of inferences run.
   EvaluationStageMetrics LatestMetrics() override;
 
-  ~TfliteInferenceStage() {}
+  ~TfliteInferenceStage() override {}
 
   // Call before Run().
   // This class does not take ownership of raw_input_ptrs.
@@ -56,9 +58,11 @@ class TfliteInferenceStage : public EvaluationStage {
     inputs_ = &raw_input_ptrs;
   }
 
+  // Resize input tensors with given shapes.
+  TfLiteStatus ResizeInputs(const std::vector<std::vector<int>>& shapes);
+
   // Applies provided delegate to the underlying TFLite Interpreter.
-  // NOTE: TFLiteInferenceStage does not take ownership of delegate.
-  TfLiteStatus ApplyCustomDelegate(TfLiteDelegate* delegate);
+  TfLiteStatus ApplyCustomDelegate(Interpreter::TfLiteDelegatePtr delegate);
 
   // Read-only view of a TfliteModelInfo. TfliteInferenceStage retains
   // ownership.
@@ -70,6 +74,9 @@ class TfliteInferenceStage : public EvaluationStage {
   const std::vector<void*>* GetOutputs() const { return &outputs_; }
 
  private:
+  // Sets model_info_ & outputs_ after interpreter tensors are (re)allocated.
+  void UpdateModelInfo();
+
   std::unique_ptr<FlatBufferModel> model_;
   std::unique_ptr<ops::builtin::BuiltinOpResolver> resolver_;
   std::unique_ptr<Interpreter> interpreter_;

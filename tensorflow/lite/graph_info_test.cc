@@ -13,10 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/lite/graph_info.h"
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
-
-#include "tensorflow/lite/graph_info.h"
 #include "tensorflow/lite/testing/util.h"
 
 namespace tflite {
@@ -32,6 +32,13 @@ TfLiteIntArray* ConvertVector(const std::vector<int>& x) {
 // A very simple test graph that supports setting in/out tensors on nodes.
 class SimpleTestGraph : public GraphInfo {
  public:
+  explicit SimpleTestGraph(int node_index_offset = 0)
+      : node_index_offset_(node_index_offset) {
+    // 'node_index_offset' number of nodes are not present in the execution
+    // plan. (and hence not considered for partitioning)
+    for (int i = 0; i < node_index_offset; ++i) AddNode({}, {});
+  }
+
   ~SimpleTestGraph() override {
     for (auto& node : nodes_) {
       TfLiteIntArrayFree(node.inputs);
@@ -39,9 +46,17 @@ class SimpleTestGraph : public GraphInfo {
     }
   }
 
+  size_t num_total_nodes() const override { return nodes_.size(); }
+  size_t num_execution_nodes() const override {
+    return nodes_.size() - node_index_offset_;
+  }
+  const TfLiteNode& node(size_t index) const override {
+    return nodes_[index + node_index_offset_];
+  }
+  size_t node_index(size_t index) const override {
+    return index + node_index_offset_;
+  }
   size_t num_tensors() const override { return tensors_.size(); }
-  size_t num_nodes() const override { return nodes_.size(); }
-  const TfLiteNode& node(size_t index) const override { return nodes_[index]; }
   TfLiteTensor* tensor(size_t index) override { return &tensors_[index]; }
   const std::vector<int>& inputs() const override { return inputs_; }
   const std::vector<int>& outputs() const override { return outputs_; }
@@ -64,6 +79,7 @@ class SimpleTestGraph : public GraphInfo {
   }
 
  private:
+  size_t node_index_offset_;
   std::vector<TfLiteNode> nodes_;
   std::vector<TfLiteTensor> tensors_;
   std::vector<int> inputs_;
@@ -143,6 +159,24 @@ TEST(PartitionTest, Nodes1PartitionNodes0) {
   CheckPartitionSubgraphs(generated_subgraphs, {expected_subgraph});
 }
 
+TEST(PartitionTest, Nodes1PartitionNodes0_WithOffset) {
+  constexpr int node_index_offset = 17;
+  SimpleTestGraph graph(node_index_offset);
+  graph.AddTensors(2);
+  graph.AddNode({0}, {1});
+  graph.SetInputsAndOutputs({0}, {1});
+  std::vector<int> nodes_to_partition = {};
+  std::vector<NodeSubset> generated_subgraphs;
+  PartitionGraph(graph, nodes_to_partition, &generated_subgraphs);
+
+  NodeSubset expected_subgraph;
+  expected_subgraph.type = NodeSubset::kTfNonPartition;
+  expected_subgraph.nodes = {node_index_offset};
+  expected_subgraph.input_tensors = {0};
+  expected_subgraph.output_tensors = {1};
+  CheckPartitionSubgraphs(generated_subgraphs, {expected_subgraph});
+}
+
 // Test a 1 node graph with no inputs that is fully partitioned.
 // Input: node(0) -> tensor(1), nodes_to_partition=[node0]
 // Output: [kTfPartition, node(0) -> tensor(1)]
@@ -206,6 +240,33 @@ TEST(PartitionTest, Nodes2PartitionNodes1) {
   NodeSubset expected_subgraph1;
   expected_subgraph1.type = NodeSubset::kTfPartition;
   expected_subgraph1.nodes = {1};
+  expected_subgraph1.input_tensors = {1};
+  expected_subgraph1.output_tensors = {2};
+  CheckPartitionSubgraphs(generated_subgraphs,
+                          {expected_subgraph0, expected_subgraph1});
+}
+
+// Same as above, but with node offset to ensure correct handling of original vs
+// execution plan indices.
+TEST(PartitionTest, Nodes2PartitionNodes1_WithOffset) {
+  constexpr int node_index_offset = 17;
+  SimpleTestGraph graph(node_index_offset);
+  graph.AddTensors(3);
+  graph.AddNode({0}, {1});
+  graph.AddNode({1}, {2});
+  graph.SetInputsAndOutputs({0}, {2});
+  std::vector<int> nodes_to_partition = {node_index_offset + 1};
+  std::vector<NodeSubset> generated_subgraphs;
+  PartitionGraph(graph, nodes_to_partition, &generated_subgraphs);
+
+  NodeSubset expected_subgraph0;
+  expected_subgraph0.type = NodeSubset::kTfPartition;
+  expected_subgraph0.nodes = {node_index_offset + 0};
+  expected_subgraph0.input_tensors = {0};
+  expected_subgraph0.output_tensors = {1};
+  NodeSubset expected_subgraph1;
+  expected_subgraph1.type = NodeSubset::kTfPartition;
+  expected_subgraph1.nodes = {node_index_offset + 1};
   expected_subgraph1.input_tensors = {1};
   expected_subgraph1.output_tensors = {2};
   CheckPartitionSubgraphs(generated_subgraphs,

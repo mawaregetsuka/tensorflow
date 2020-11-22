@@ -25,12 +25,11 @@ limitations under the License.
 #include "tensorflow/compiler/jit/defs.h"
 #include "tensorflow/compiler/tf2xla/xla_op_kernel.h"
 #include "tensorflow/compiler/tf2xla/xla_op_registry.h"
+#include "tensorflow/core/common_runtime/graph_constructor.h"
 #include "tensorflow/core/framework/node_def_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/graph/algorithm.h"
-#include "tensorflow/core/graph/graph_constructor.h"
 #include "tensorflow/core/graph/graph_def_builder.h"
-#include "tensorflow/core/graph/graph_def_builder_util.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
 #include "tensorflow/core/platform/test.h"
 
@@ -1219,6 +1218,94 @@ TEST(DeadnessAnalysisTest, RefBoolSwitchCondition) {
 
   EXPECT_EQ(predicate_map[ControlOutputFor(id_false)], "~*cond_ref:0");
   EXPECT_EQ(predicate_map[ControlOutputFor(id_true)], "*cond_ref:0");
+}
+
+void CreateSwitchN(const Scope& scope, Input data, Input output_index,
+                   int64 num_outs, OutputList* outputs) {
+  if (!scope.ok()) return;
+  auto _data = ops::AsNodeOut(scope, data);
+  if (!scope.ok()) return;
+  auto _output_index = ops::AsNodeOut(scope, output_index);
+  if (!scope.ok()) return;
+  Node* ret;
+  const auto unique_name = scope.GetUniqueNameForOp("_SwitchN");
+  auto builder = NodeBuilder(unique_name, "_SwitchN")
+                     .Input(_data)
+                     .Input(_output_index)
+                     .Attr("num_outs", num_outs);
+  scope.UpdateBuilder(&builder);
+  scope.UpdateStatus(builder.Finalize(scope.graph(), &ret));
+  if (!scope.ok()) return;
+  scope.UpdateStatus(scope.DoShapeInference(ret));
+  for (int32 i = 0; i < ret->num_outputs(); ++i) {
+    outputs->push_back(Output(ret, i));
+  }
+}
+
+TEST(DeadnessAnalysisTest, Constant1_SwitchN_2Branches_DoesNotFail) {
+  Scope root = Scope::NewRootScope().ExitOnError();
+
+  Output constant_1 = ops::Const(root.WithOpName("const_1"), 1);
+  Output value = ops::Placeholder(root.WithOpName("value"), DT_FLOAT);
+  OutputList outputs;
+  CreateSwitchN(root.WithOpName("switchn"), value, constant_1, 2, &outputs);
+
+  Output id_0 = ops::Identity(root.WithOpName("id_0"), outputs[0]);
+  Output id_1 = ops::Identity(root.WithOpName("id_1"), outputs[1]);
+
+  FixupSourceAndSinkEdges(root.graph());
+
+  PredicateMapTy predicate_map;
+  TF_ASSERT_OK(ComputePredicates(*root.graph(), &predicate_map));
+
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_0)], "#false");
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_1)], "#true");
+}
+
+TEST(DeadnessAnalysisTest, Constant7_SwitchN_3Branches) {
+  Scope root = Scope::NewRootScope().ExitOnError();
+
+  Output constant_7 = ops::Const(root.WithOpName("const_7"), 7);
+  Output value = ops::Placeholder(root.WithOpName("value"), DT_FLOAT);
+  OutputList outputs;
+  CreateSwitchN(root.WithOpName("switchn"), value, constant_7, 3, &outputs);
+
+  Output id_0 = ops::Identity(root.WithOpName("id_0"), outputs[0]);
+  Output id_1 = ops::Identity(root.WithOpName("id_1"), outputs[1]);
+  Output id_2 = ops::Identity(root.WithOpName("id_2"), outputs[2]);
+
+  FixupSourceAndSinkEdges(root.graph());
+
+  PredicateMapTy predicate_map;
+  TF_ASSERT_OK(ComputePredicates(*root.graph(), &predicate_map));
+
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_0)], "#false");
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_1)], "#false");
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_2)], "#true");
+}
+
+TEST(DeadnessAnalysisTest, RefInt_SwitchN_3Branches) {
+  Scope root = Scope::NewRootScope().ExitOnError();
+
+  Output condition_ref_var =
+      ops::Variable(root.WithOpName("bidx"), TensorShape({}), DT_INT32);
+  Output value = ops::Placeholder(root.WithOpName("value"), DT_FLOAT);
+  OutputList outputs;
+  CreateSwitchN(root.WithOpName("switchn"), value, condition_ref_var, 3,
+                &outputs);
+
+  Output id_0 = ops::Identity(root.WithOpName("id_0"), outputs[0]);
+  Output id_1 = ops::Identity(root.WithOpName("id_1"), outputs[1]);
+  Output id_2 = ops::Identity(root.WithOpName("id_2"), outputs[2]);
+
+  FixupSourceAndSinkEdges(root.graph());
+
+  PredicateMapTy predicate_map;
+  TF_ASSERT_OK(ComputePredicates(*root.graph(), &predicate_map));
+
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_0)], "bidx:0=0");
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_1)], "(~bidx:0=0 & bidx:0=1)");
+  EXPECT_EQ(predicate_map[ControlOutputFor(id_2)], "(~bidx:0=0 & ~bidx:0=1)");
 }
 
 }  // namespace

@@ -62,9 +62,9 @@ class StringDest : public WritableFile {
     contents_->append(slice.data(), slice.size());
     return Status::OK();
   }
-#if defined(PLATFORM_GOOGLE)
+#if defined(TF_CORD_SUPPORT)
   Status Append(const absl::Cord& data) override {
-    contents_->append(data.ToString());
+    contents_->append(std::string(data));
     return Status::OK();
   }
 #endif
@@ -136,7 +136,7 @@ class RecordioTest : public ::testing::Test {
     TF_ASSERT_OK(writer_->WriteRecord(StringPiece(msg)));
   }
 
-#if defined(PLATFORM_GOOGLE)
+#if defined(TF_CORD_SUPPORT)
   void Write(const absl::Cord& msg) {
     ASSERT_TRUE(!reading_) << "Write() after starting to read";
     TF_ASSERT_OK(writer_->WriteRecord(msg));
@@ -149,7 +149,7 @@ class RecordioTest : public ::testing::Test {
     if (!reading_) {
       reading_ = true;
     }
-    string record;
+    tstring record;
     Status s = reader_->ReadRecord(&readpos_, &record);
     if (s.ok()) {
       return record;
@@ -183,7 +183,7 @@ class RecordioTest : public ::testing::Test {
     Write(BigString("x", 10000));
     reading_ = true;
     uint64 offset = WrittenBytes() + offset_past_end;
-    string record;
+    tstring record;
     Status s = reader_->ReadRecord(&offset, &record);
     ASSERT_TRUE(errors::IsOutOfRange(s)) << s;
   }
@@ -204,7 +204,7 @@ TEST_F(RecordioTest, ReadWrite) {
   ASSERT_EQ("EOF", Read());  // Make sure reads at eof work
 }
 
-#if defined(PLATFORM_GOOGLE)
+#if defined(TF_CORD_SUPPORT)
 TEST_F(RecordioTest, ReadWriteCords) {
   Write(absl::Cord("foo"));
   Write(absl::Cord("bar"));
@@ -261,7 +261,7 @@ void TestNonSequentialReads(const RecordWriterOptions& writer_options,
   StringSource file(&contents);
   RecordReader reader(&file, reader_options);
 
-  string record;
+  tstring record;
   // First read sequentially to fill in the offsets table.
   uint64 offsets[10] = {0};
   uint64 offset = 0;
@@ -315,7 +315,7 @@ void TestReadError(const RecordWriterOptions& writer_options,
   RecordReader reader(&file, reader_options);
 
   uint64 offset = 0;
-  string read;
+  tstring read;
   file.force_error();
   Status status = reader.ReadRecord(&offset, &read);
   ASSERT_TRUE(errors::IsDataLoss(status));

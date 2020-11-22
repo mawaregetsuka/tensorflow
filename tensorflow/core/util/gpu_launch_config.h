@@ -168,23 +168,10 @@ GpuLaunchConfig GetGpuLaunchConfig(int work_element_count,
       block_size_limit);
   CHECK_EQ(err, cudaSuccess);
 #elif TENSORFLOW_USE_ROCM
-  // ROCM TODO re-enable this after hipOccupancyMaxPotentialBlockSize is
-  // implemented
-  // hipError_t err = hipOccupancyMaxPotentialBlockSize(
-  //    &block_count, &thread_per_block, func, dynamic_shared_memory_size,
-  //    block_size_limit);
-  // CHECK_EQ(err, hipSuccess);
-
-  // Apply the heuristic in GetGpuLaunchConfig(int, const Eigen::GpuDevice&)
-  // that the kernel is quite simple and will largely be memory-limited.
-  const int physical_thread_count = std::min(
-      d.getNumGpuMultiProcessors() * d.maxGpuThreadsPerMultiProcessor(),
-      work_element_count);
-  // Assume the kernel be simple enough that it is okay to use 1024 threads
-  // per workgroup.
-  thread_per_block = std::min(1024, d.maxGpuThreadsPerBlock());
-  block_count = std::min(DivUp(physical_thread_count, thread_per_block),
-                         d.getNumGpuMultiProcessors());
+  hipError_t err = hipOccupancyMaxPotentialBlockSize(
+      &block_count, &thread_per_block, func, dynamic_shared_memory_size,
+      block_size_limit);
+  CHECK_EQ(err, hipSuccess);
 #endif
 
   block_count =
@@ -213,27 +200,13 @@ GpuLaunchConfig GetGpuLaunchConfigFixedBlockSize(
   cudaError_t err = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
       &block_count, func, fixed_block_size, dynamic_shared_memory_size);
   CHECK_EQ(err, cudaSuccess);
+#elif TENSORFLOW_USE_ROCM
+  hipError_t err = hipOccupancyMaxActiveBlocksPerMultiprocessor(
+      &block_count, func, fixed_block_size, dynamic_shared_memory_size);
+  CHECK_EQ(err, hipSuccess);
+#endif
   block_count = std::min(block_count * d.getNumGpuMultiProcessors(),
                          DivUp(work_element_count, fixed_block_size));
-#elif TENSORFLOW_USE_ROCM
-  // ROCM TODO re-enable this after hipOccupancyMaxActiveBlocksPerMultiprocessor
-  // is implemented
-  // hipError_t err = hipOccupancyMaxActiveBlocksPerMultiprocessor(
-  //    &block_count, &thread_per_block, func, dynamic_shared_memory_size,
-  //    block_size_limit);
-  // CHECK_EQ(err, hipSuccess);
-
-  // Apply the heuristic in GetGpuLaunchConfig(int, const Eigen::GpuDevice&)
-  // that the kernel is quite simple and will largely be memory-limited.
-  const int physical_thread_count = std::min(
-      d.getNumGpuMultiProcessors() * d.maxGpuThreadsPerMultiProcessor(),
-      work_element_count);
-  // Assume the kernel be simple enough that it is okay to use 1024 threads
-  // per workgroup.
-  int thread_per_block = std::min(1024, d.maxGpuThreadsPerBlock());
-  block_count = std::min(DivUp(physical_thread_count, thread_per_block),
-                         d.getNumGpuMultiProcessors());
-#endif
 
   config.virtual_thread_count = work_element_count;
   config.thread_per_block = fixed_block_size;
@@ -374,17 +347,6 @@ Gpu2DLaunchConfig GetGpu2DLaunchConfig(int xdim, int ydim,
 CREATE_CUDA_HOST_FUNCTION_ALIAS(GetGpu2DLaunchConfig, GetCuda2DLaunchConfig);
 
 #if GOOGLE_CUDA
-// Returns a raw reference to the current cuda stream.  Required by a
-// number of kernel calls (for which StreamInterface* does not work), i.e.
-// CUB and certain cublas primitives.
-inline const cudaStream_t& GetCudaStream(OpKernelContext* context) {
-  const cudaStream_t* ptr = CHECK_NOTNULL(
-      reinterpret_cast<const cudaStream_t*>(context->op_device_context()
-                                                ->stream()
-                                                ->implementation()
-                                                ->GpuStreamMemberHack()));
-  return *ptr;
-}
 template <typename DeviceFunc>
 Cuda2DLaunchConfig GetCuda2DLaunchConfig(int xdim, int ydim,
                                          const Eigen::GpuDevice& d,

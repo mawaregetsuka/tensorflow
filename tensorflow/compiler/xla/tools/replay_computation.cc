@@ -86,8 +86,7 @@ namespace {
 // Command-line opts to this tool.  See main() for descriptions of these
 // fields.
 struct Options {
-  Options()
-      : intra_op_thread_pool_size(tensorflow::port::NumSchedulableCPUs()) {}
+  Options() : intra_op_thread_pool_size(tensorflow::port::MaxParallelism()) {}
 
   bool NeedsRealData() const { return !use_fake_data && !compile_only; }
 
@@ -126,7 +125,11 @@ StatusOr<std::unique_ptr<LocalExecutable>> CompileExecutable(
   }
   ExecutableBuildOptions exec_build_options;
   *exec_build_options.mutable_debug_options() = GetDebugOptionsFromFlags();
-  return client->Compile(computation, argument_layout_ptrs, exec_build_options);
+  TF_ASSIGN_OR_RETURN(
+      auto executables,
+      client->Compile(computation, argument_layout_ptrs, exec_build_options));
+  TF_RET_CHECK(executables.size() == 1);
+  return std::move(executables[0]);
 }
 
 absl::optional<Shape> GetXfeedShape(bool is_infeed,
@@ -230,8 +233,15 @@ StatusOr<Literal> ReplayComputation(const HloSnapshot& module,
   if (opts.use_fake_data) {
     // Run fake computations with debug options ignoring XLA_FLAGS.  Users very
     // likely want XLA_FLAGS only to apply to the "real" computation being run,
-    // not to the fake computations we use for generating arguments.
+    // not to the fake computations we use for generating arguments. There is
+    // an exception. ptxas can be called during the generation of fake
+    // data. As it is cached in the process memory, the flag affecting this call
+    // should not be ignored.
+    auto debug_opts_flags = GetDebugOptionsFromFlags();
     auto debug_opts = DefaultDebugOptionsIgnoringFlags();
+    debug_opts.set_xla_gpu_asm_extra_flags(
+        debug_opts_flags.xla_gpu_asm_extra_flags());
+
     global_data_arguments =
         MakeFakeArgumentsOrDie(computation, client, &debug_opts);
     for (const auto& data : global_data_arguments) {
@@ -347,7 +357,7 @@ StatusOr<std::vector<HloSnapshot>> ParseRecordIoFile(absl::string_view filename,
 
   std::vector<HloSnapshot> snapshots;
   uint64 offset = 0;
-  string record;
+  tensorflow::tstring record;
   while (reader.ReadRecord(&offset, &record).ok()) {
     HloSnapshot snapshot;
     if (snapshot.mutable_hlo()->ParseFromString(record)) {
@@ -392,7 +402,7 @@ StatusOr<HloSnapshot> ParseSingleHloFile(const string& filename,
   HloModuleConfig config;
   config.set_debug_options(GetDebugOptionsFromFlags());
   StatusOr<std::unique_ptr<HloModule>> module =
-      ParseHloString(contents, config);
+      ParseAndReturnUnverifiedModule(contents, config);
   if (module.ok()) {
     *snapshot.mutable_hlo()->mutable_hlo_module() =
         module.ValueOrDie()->ToProto();

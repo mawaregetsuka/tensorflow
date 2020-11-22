@@ -27,12 +27,11 @@ from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops.ragged import ragged_array_ops
 from tensorflow.python.ops.ragged import ragged_factory_ops
-from tensorflow.python.ops.ragged import ragged_test_util
 from tensorflow.python.platform import googletest
 
 
 @test_util.run_all_in_graph_and_eager_modes
-class RaggedBooleanMaskOpTest(ragged_test_util.RaggedTensorTestCase,
+class RaggedBooleanMaskOpTest(test_util.TensorFlowTestCase,
                               parameterized.TestCase):
   # Define short constants for true & false, so the data & mask can be lined
   # up in the examples below.  This makes it easier to read the examples, to
@@ -243,39 +242,40 @@ class RaggedBooleanMaskOpTest(ragged_test_util.RaggedTensorTestCase,
   ])  # pyformat: disable
   def testBooleanMask(self, descr, data, mask, expected):
     actual = ragged_array_ops.boolean_mask(data, mask)
-    self.assertRaggedEqual(actual, expected)
+    self.assertAllEqual(actual, expected)
 
   def testErrors(self):
     if not context.executing_eagerly():
-      self.assertRaisesRegexp(ValueError,
-                              r'mask\.shape\.ndims must be known statically',
-                              ragged_array_ops.boolean_mask, [[1, 2]],
-                              array_ops.placeholder(dtypes.bool))
+      self.assertRaisesRegex(ValueError,
+                             r'mask\.shape\.ndims must be known statically',
+                             ragged_array_ops.boolean_mask, [[1, 2]],
+                             array_ops.placeholder(dtypes.bool))
 
     self.assertRaises(TypeError, ragged_array_ops.boolean_mask, [[1, 2]],
                       [[0, 1]])
-    self.assertRaisesRegexp(
+    self.assertRaisesRegex(
         ValueError, 'Tensor conversion requested dtype bool for '
         'RaggedTensor with dtype int32', ragged_array_ops.boolean_mask,
         ragged_factory_ops.constant([[1, 2]]),
         ragged_factory_ops.constant([[0, 0]]))
 
-    self.assertRaisesRegexp(
-        ValueError, r'Shapes \(1, 2\) and \(1, 3\) are incompatible',
-        ragged_array_ops.boolean_mask, [[1, 2]], [[True, False, True]])
+    self.assertRaisesRegex(ValueError,
+                           r'Shapes \(1, 2\) and \(1, 3\) are incompatible',
+                           ragged_array_ops.boolean_mask, [[1, 2]],
+                           [[True, False, True]])
 
-    self.assertRaisesRegexp(errors.InvalidArgumentError,
-                            r'Inputs must have identical ragged splits',
-                            ragged_array_ops.boolean_mask,
-                            ragged_factory_ops.constant([[1, 2]]),
-                            ragged_factory_ops.constant([[True, False, True]]))
+    self.assertRaisesRegex(errors.InvalidArgumentError,
+                           r'Inputs must have identical ragged splits',
+                           ragged_array_ops.boolean_mask,
+                           ragged_factory_ops.constant([[1, 2]]),
+                           ragged_factory_ops.constant([[True, False, True]]))
 
-    self.assertRaisesRegexp(ValueError, 'mask cannot be scalar',
-                            ragged_array_ops.boolean_mask, [[1, 2]], True)
+    self.assertRaisesRegex(ValueError, 'mask cannot be scalar',
+                           ragged_array_ops.boolean_mask, [[1, 2]], True)
 
-    self.assertRaisesRegexp(ValueError, 'mask cannot be scalar',
-                            ragged_array_ops.boolean_mask,
-                            ragged_factory_ops.constant([[1, 2]]), True)
+    self.assertRaisesRegex(ValueError, 'mask cannot be scalar',
+                           ragged_array_ops.boolean_mask,
+                           ragged_factory_ops.constant([[1, 2]]), True)
 
 
 if __name__ == '__main__':

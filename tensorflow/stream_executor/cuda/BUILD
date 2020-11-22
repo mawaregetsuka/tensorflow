@@ -1,21 +1,27 @@
 # Description:
 #   CUDA-platform specific StreamExecutor support code.
 
-load("//tensorflow:tensorflow.bzl", "tf_cc_test")
+load("//tensorflow:tensorflow.bzl", "tf_cc_test", "tf_copts", "tf_cuda_cc_test")
+load("//tensorflow:tensorflow.bzl", "filegroup")
 load(
     "//tensorflow/stream_executor:build_defs.bzl",
     "stream_executor_friends",
     "tf_additional_cuda_driver_deps",
     "tf_additional_cuda_platform_deps",
     "tf_additional_cudnn_plugin_deps",
-    "tf_additional_cupti_stub_data",
 )
-load("//tensorflow:tensorflow.bzl", "tf_copts")
 load(
-    "//tensorflow/core:platform/default/cuda_build_defs.bzl",
+    "//tensorflow/core/platform/default:cuda_build_defs.bzl",
     "if_cuda_is_configured",
 )
-load("//tensorflow/core:platform/default/build_config_root.bzl", "if_static")
+load(
+    "//tensorflow/core/platform:build_config_root.bzl",
+    "tf_cuda_tests_tags",
+)
+load(
+    "//tensorflow/core/platform:rules_cc.bzl",
+    "cc_library",
+)
 
 package(
     default_visibility = [":friends"],
@@ -61,11 +67,13 @@ cc_library(
             "//tensorflow/stream_executor/platform",
         ],
     ) + tf_additional_cuda_platform_deps() + [
+        "@com_google_absl//absl/base",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/synchronization",
+        "//tensorflow/core:lib",
     ],
     alwayslink = True,  # Registers itself with the MultiPlatformManager.
 )
@@ -86,7 +94,7 @@ cc_library(
 cc_library(
     name = "cuda_stub",
     srcs = if_cuda_is_configured(["cuda_stub.cc"]),
-    textual_hdrs = ["cuda_10_0.inc"],
+    textual_hdrs = glob(["cuda_*.inc"]),
     deps = if_cuda_is_configured([
         "@local_config_cuda//cuda:cuda_headers",
         "//tensorflow/stream_executor/lib",
@@ -94,23 +102,13 @@ cc_library(
     ]),
 )
 
-cc_library(
-    name = "ptxas_utils",
-    srcs = if_cuda_is_configured(["ptxas_utils.cc"]),
-    hdrs = if_cuda_is_configured(["ptxas_utils.h"]),
-    deps = if_cuda_is_configured([
-        "//tensorflow/stream_executor/gpu:gpu_helpers_header",
-        ":cuda_driver",
-        "@com_google_absl//absl/types:span",
-        "//tensorflow/stream_executor/lib",
-        "//tensorflow/stream_executor/platform",
-        "@com_google_absl//absl/strings:str_format",
-        "@com_google_absl//absl/synchronization",
-        "//tensorflow/core:cuda_libdevice_path",
-        "//tensorflow/core:lib",
-        "//tensorflow/core:regexp_internal",
-    ]) + ["@com_google_absl//absl/container:flat_hash_map"],
-)
+# Buildozer can not remove dependencies inside select guards, so we have to use
+# an intermediate target.
+cc_library(name = "ptxas_wrapper")
+
+# Buildozer can not remove dependencies inside select guards, so we have to use
+# an intermediate target.
+cc_library(name = "fatbinary_wrapper")
 
 cc_library(
     name = "cuda_driver",
@@ -130,8 +128,8 @@ cc_library(
         "//tensorflow/stream_executor/platform:dso_loader",
     ] + tf_additional_cuda_driver_deps()) + select({
         # include dynamic loading implementation only when if_cuda_is_configured and build dynamically
-        "//tensorflow:using_cuda_nvcc_with_dynamic_build": ["cudart_stub"],
-        "//tensorflow:using_cuda_clang_with_dynamic_build": ["cudart_stub"],
+        "//tensorflow:build_oss_using_cuda_nvcc": ["cudart_stub"],
+        "//tensorflow:build_oss_using_cuda_clang": ["cudart_stub"],
         "//conditions:default": ["//tensorflow/core:cuda"],
     }) + [
         "@com_google_absl//absl/base:core_headers",
@@ -141,24 +139,51 @@ cc_library(
     ],
 )
 
+tf_cuda_cc_test(
+    name = "cuda_driver_test",
+    srcs = ["cuda_driver_test.cc"],
+    tags = tf_cuda_tests_tags() + [
+        "no_cuda_asan",  # TODO(b/171512140): re-enable.
+    ],
+    deps = [
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+        "//tensorflow/stream_executor/lib",
+        "@local_config_cuda//cuda:cuda_headers",
+    ],
+)
+
+tf_cuda_cc_test(
+    name = "memcpy_test",
+    srcs = ["memcpy_test.cc"],
+    tags = tf_cuda_tests_tags() + [
+        "no_cuda_asan",  # TODO(b/171512140): re-enable.
+    ],
+    deps = [
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+        "//tensorflow/stream_executor/lib",
+    ],
+)
+
 cc_library(
     name = "cudart_stub",
     srcs = select({
         # include dynamic loading implementation only when if_cuda_is_configured and build dynamically
-        "//tensorflow:using_cuda_nvcc_with_dynamic_build": ["cudart_stub.cc"],
-        "//tensorflow:using_cuda_clang_with_dynamic_build": ["cudart_stub.cc"],
+        "//tensorflow:build_oss_using_cuda_nvcc": ["cudart_stub.cc"],
+        "//tensorflow:build_oss_using_cuda_clang": ["cudart_stub.cc"],
         "//conditions:default": [],
     }),
     textual_hdrs = glob(["cuda_runtime_*.inc"]),
     visibility = ["//visibility:public"],
     deps = select({
-        "//tensorflow:using_cuda_nvcc_with_dynamic_build": [
+        "//tensorflow:build_oss_using_cuda_nvcc": [
             ":cuda_stub",
             "@local_config_cuda//cuda:cuda_headers",
             "//tensorflow/stream_executor/lib",
             "//tensorflow/stream_executor/platform:dso_loader",
         ],
-        "//tensorflow:using_cuda_clang_with_dynamic_build": [
+        "//tensorflow:build_oss_using_cuda_clang": [
             ":cuda_stub",
             "@local_config_cuda//cuda:cuda_headers",
             "//tensorflow/stream_executor/lib",
@@ -223,11 +248,36 @@ cc_library(
 
 alias(
     name = "cublas_lib",
-    actual = if_static(
-        "@local_config_cuda//cuda:cublas",
-        ":cublas_stub",
-    ),
-    visibility = ["//visibility:private"],
+    actual = select({
+        "//tensorflow:oss": ":cublas_stub",
+        "//conditions:default": "@local_config_cuda//cuda:cublas",
+    }),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "cublas_lt_stub",
+    srcs = if_cuda_is_configured(["cublasLt_stub.cc"]),
+    textual_hdrs = glob(["cublasLt_*.inc"]),
+    deps = if_cuda_is_configured([
+        # LINT.IfChange
+        "@local_config_cuda//cuda:cublas_headers",
+        # LINT.ThenChange(//tensorflow/copy.bara.sky:cublasLt_headers)
+        "@local_config_cuda//cuda:cuda_headers",
+        "//tensorflow/stream_executor/lib",
+        "//tensorflow/stream_executor/platform:dso_loader",
+    ]),
+)
+
+cc_library(name = "empty_lib")
+
+alias(
+    name = "cublas_lt_lib",
+    actual = select({
+        "//tensorflow:oss": ":cublas_lt_stub",
+        "//conditions:default": ":empty_lib",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
@@ -237,6 +287,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = if_cuda_is_configured([
         ":cublas_lib",
+        ":cublas_lt_lib",
         ":cuda_activation",
         ":cuda_gpu_executor",
         ":cuda_platform_id",
@@ -249,7 +300,9 @@ cc_library(
         "@local_config_cuda//cuda:cublas_headers",
         # LINT.ThenChange(//tensorflow/copy.bara.sky:cublas_headers)
         "@local_config_cuda//cuda:cuda_headers",
+        "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
+        "//tensorflow/core/platform:tensor_float_32_utils",
         "//tensorflow/stream_executor",
         "//tensorflow/stream_executor:event",
         "//tensorflow/stream_executor:host_or_device_scalar",
@@ -269,9 +322,12 @@ cc_library(
 cc_library(
     name = "cufft_stub",
     srcs = if_cuda_is_configured(["cufft_stub.cc"]),
-    textual_hdrs = ["cufft_10_0.inc"],
+    textual_hdrs = glob(["cufft_*.inc"]),
     deps = if_cuda_is_configured([
         "@local_config_cuda//cuda:cuda_headers",
+        # LINT.IfChange
+        "@local_config_cuda//cuda:cufft_headers",
+        # LINT.ThenChange(//tensorflow/copy.bara.sky:cublas_headers)
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform:dso_loader",
     ]),
@@ -279,11 +335,11 @@ cc_library(
 
 alias(
     name = "cufft_lib",
-    actual = if_static(
-        "@local_config_cuda//cuda:cufft",
-        ":cufft_stub",
-    ),
-    visibility = ["//visibility:private"],
+    actual = select({
+        "//tensorflow:oss": ":cufft_stub",
+        "//conditions:default": "@local_config_cuda//cuda:cufft",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
@@ -319,16 +375,17 @@ cc_library(
         "@local_config_cuda//cuda:cudnn_header",
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform:dso_loader",
+        ":cudnn_version",
     ]),
 )
 
 alias(
     name = "cudnn_lib",
-    actual = if_static(
-        "@local_config_cuda//cuda:cudnn",
-        ":cudnn_stub",
-    ),
-    visibility = ["//visibility:private"],
+    actual = select({
+        "//tensorflow:oss": ":cudnn_stub",
+        "//conditions:default": "@local_config_cuda//cuda:cudnn",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
@@ -346,12 +403,14 @@ cc_library(
         ":cuda_timer",
         ":cudnn_version",
         ":cudnn_lib",
+        "@com_google_absl//absl/memory",
         "@com_google_absl//absl/strings",
         "//third_party/eigen3",
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudnn_header",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
+        "//tensorflow/core/platform:tensor_float_32_utils",
         "//tensorflow/stream_executor:dnn",
         "//tensorflow/stream_executor:event",
         "//tensorflow/stream_executor:plugin_registry",
@@ -370,6 +429,9 @@ cc_library(
     textual_hdrs = ["curand_10_0.inc"],
     deps = if_cuda_is_configured([
         "@local_config_cuda//cuda:cuda_headers",
+        # LINT.IfChange
+        "@local_config_cuda//cuda:curand_headers",
+        # LINT.ThenChange(//tensorflow/copy.bara.sky:cublas_headers)
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform:dso_loader",
     ]),
@@ -377,18 +439,17 @@ cc_library(
 
 alias(
     name = "curand_lib",
-    actual = if_static(
-        "@local_config_cuda//cuda:curand",
-        ":curand_stub",
-    ),
-    visibility = ["//visibility:private"],
+    actual = select({
+        "//tensorflow:oss": ":curand_stub",
+        "//conditions:default": "@local_config_cuda//cuda:curand",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
     name = "curand_plugin",
     srcs = if_cuda_is_configured(["cuda_rng.cc"]),
     hdrs = if_cuda_is_configured(["cuda_rng.h"]),
-    visibility = ["//visibility:public"],
     deps = if_cuda_is_configured([
         ":cuda_activation",
         ":cuda_gpu_executor",
@@ -412,9 +473,10 @@ cc_library(
 cc_library(
     name = "cupti_stub",
     srcs = if_cuda_is_configured(["cupti_stub.cc"]),
-    data = if_cuda_is_configured(tf_additional_cupti_stub_data()),
+    data = if_cuda_is_configured(["@local_config_cuda//cuda:cupti_dsos"]),
     textual_hdrs = ["cupti_10_0.inc"],
     deps = if_cuda_is_configured([
+        "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cupti_headers",
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform:dso_loader",
@@ -424,15 +486,25 @@ cc_library(
 cc_library(
     name = "cusolver_stub",
     srcs = if_cuda_is_configured(["cusolver_stub.cc"]),
-    textual_hdrs = ["cusolver_dense_10_0.inc"],
+    textual_hdrs = glob(["cusolver_dense_*.inc"]),
     deps = if_cuda_is_configured([
         # LINT.IfChange
         "@local_config_cuda//cuda:cublas_headers",
+        "@local_config_cuda//cuda:cusolver_headers",
         # LINT.ThenChange(//tensorflow/copy.bara.sky:cublas_headers)
         "@local_config_cuda//cuda:cuda_headers",
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform:dso_loader",
     ]),
+)
+
+alias(
+    name = "cusolver_lib",
+    actual = select({
+        "//tensorflow:oss": ":cusolver_stub",
+        "//conditions:default": "@local_config_cuda//cuda:cusolver",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
@@ -441,9 +513,21 @@ cc_library(
     textual_hdrs = glob(["cusparse_*.inc"]),
     deps = if_cuda_is_configured([
         "@local_config_cuda//cuda:cuda_headers",
+        # LINT.IfChange
+        "@local_config_cuda//cuda:cusparse_headers",
+        # LINT.ThenChange(//tensorflow/copy.bara.sky:cublas_headers)
         "//tensorflow/stream_executor/lib",
         "//tensorflow/stream_executor/platform:dso_loader",
     ]),
+)
+
+alias(
+    name = "cusparse_lib",
+    actual = select({
+        "//tensorflow:oss": ":cusparse_stub",
+        "//conditions:default": "@local_config_cuda//cuda:cusparse",
+    }),
+    visibility = ["//visibility:public"],
 )
 
 cc_library(
@@ -573,4 +657,25 @@ cc_library(
         ":curand_plugin",
     ],
     alwayslink = 1,
+)
+
+tf_cuda_cc_test(
+    name = "redzone_allocator_test",
+    srcs = ["redzone_allocator_test.cc"],
+    tags = tf_cuda_tests_tags() + [
+        "no_cuda_asan",  # TODO(b/171512140): re-enable.
+    ],
+    deps = [
+        ":cuda_activation",
+        ":cuda_gpu_executor",
+        "//tensorflow/core:test",
+        "//tensorflow/core:test_main",
+        "//tensorflow/core/platform:stream_executor_no_cuda",
+        "//tensorflow/core/platform/default/build_config:stream_executor_cuda",
+        "//tensorflow/stream_executor:device_memory_allocator",
+        "//tensorflow/stream_executor:event",
+        "//tensorflow/stream_executor:kernel",
+        "//tensorflow/stream_executor/gpu:gpu_asm_opts",
+        "//tensorflow/stream_executor/gpu:redzone_allocator",
+    ],
 )

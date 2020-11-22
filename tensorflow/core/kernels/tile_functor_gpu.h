@@ -30,8 +30,9 @@ namespace tensorflow {
 namespace internal {
 
 template <typename T>
-__global__ void TileKernel(int nthreads, const T* src, const int32* buf,
-                           const int32 ndims, T* dst) {
+__global__ void TileKernel(int nthreads, const T* __restrict__ src,
+                           const int32* __restrict__ buf, const int32 ndims,
+                           T* __restrict__ dst) {
   const int32* in_strides = buf;
   const int32* out_strides = buf + ndims;
   const int32* in_dim_sizes = buf + ndims * 2;
@@ -65,7 +66,7 @@ void TileSimple(const Eigen::GpuDevice& d, Tensor* out, const Tensor& in) {
   }
   // Copies the input strides, output strides and input dimension sizes to the
   // device.
-  auto num_bytes = sizeof(int64) * host_buf.size();
+  auto num_bytes = sizeof(int32) * host_buf.size();
   auto dev_buf = d.allocate(num_bytes);
   // NOTE: host_buf is not allocated by GpuHostAllocator, and
   // therefore we are doing a sync copy effectively.

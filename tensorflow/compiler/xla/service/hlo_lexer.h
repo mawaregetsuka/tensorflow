@@ -61,10 +61,11 @@ enum class TokKind {
   kw_false,
   kw_maximal,
   kw_replicated,
+  kw_last_tile_dim_replicate,
   kw_nan,
   kw_inf,
-  kw_sparse,
 
+  kNegNan,  // -nan
   kNegInf,  // -inf
 
   // Typed tokens.
@@ -148,8 +149,6 @@ class HloLexer {
   // or it's out of the range of the current buffer.
   absl::string_view StringPieceFromPointers(const char* begin,
                                             const char* end) const;
-  tensorflow::RegexpStringPiece RegexpStringPieceFromPointers(
-      const char* begin, const char* end) const;
 
   // Returns true if the given ptr is dereferenceable within the range of the
   // current buffer.

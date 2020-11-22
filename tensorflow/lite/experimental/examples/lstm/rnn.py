@@ -20,7 +20,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import tensorflow.lite.python.op_hint as op_hint
+from tensorflow.lite.python.op_hint import OpHint
 from tensorflow.python.eager import context
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
@@ -34,11 +34,14 @@ from tensorflow.python.ops.rnn import _best_effort_input_batch_size
 from tensorflow.python.ops.rnn import _dynamic_rnn_loop
 from tensorflow.python.ops.rnn import _should_cache
 from tensorflow.python.ops.rnn import _transpose_batch_time
+from tensorflow.python.util import deprecation
 from tensorflow.python.util import nest
 from tensorflow.python.util.tf_export import tf_export
 
 
 @tf_export(v1=["lite.experimental.nn.dynamic_rnn"])
+@deprecation.deprecated(
+    None, "Use `keras.layers.LSTM` instead.")
 def dynamic_rnn(cell,
                 inputs,
                 sequence_length=None,
@@ -190,7 +193,7 @@ def dynamic_rnn(cell,
       "parent_last_child_output": parent_last_child_output,
       "internal_children_input_output": internal_children_input_output
   }
-  tflite_wrapper = op_hint.OpHint(
+  tflite_wrapper = OpHint(
       "TfLiteDynamicRnn",
       level=2,
       children_inputs_mappings=inputs_outputs_mappings)

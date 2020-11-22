@@ -59,9 +59,10 @@ def gentbl(name, tblgen, td_file, td_srcs, tbl_outs, library = True, **kwargs):
             outs = [out],
             tools = [tblgen],
             message = "Generating code from table: %s" % td_file,
-            cmd = (("$(location %s) " + "-I external/llvm/include " +
-                    "-I external/llvm/tools/clang/include " +
-                    "-I $$(dirname $(location %s)) " + "%s $(location %s) -o $@") % (
+            cmd = (("$(location %s) " + "-I external/llvm-project/llvm/include " +
+                    "-I external/llvm-project/clang/include " +
+                    "-I $$(dirname $(location %s)) " + ("%s $(location %s) --long-string-literals=0 " +
+                                                        "-o $@")) % (
                 tblgen,
                 td_file,
                 opts,
@@ -102,7 +103,7 @@ def _quote(s):
       command.
     """
     return ('"' +
-            s.replace("\\", "\\\\").replace("$", "\\$").replace('"', '\\"') +
+            s.replace("\\", "\\\\").replace("$", "\\$").replace('"', "\\\"") +
             '"')
 
 def cmake_var_string(cmake_vars):
@@ -189,6 +190,7 @@ posix_cmake_vars = {
     "HAVE_PTHREAD_H": 1,
     "HAVE_SIGNAL_H": 1,
     "HAVE_STDINT_H": 1,
+    "HAVE_SYSEXITS_H": 1,
     "HAVE_SYS_IOCTL_H": 1,
     "HAVE_SYS_MMAN_H": 1,
     "HAVE_SYS_PARAM_H": 1,
@@ -245,6 +247,12 @@ linux_cmake_vars = {
     "HAVE_LINK_H": 1,
     "HAVE_MALLINFO": 1,
     "HAVE_FUTIMENS": 1,
+}
+
+# CMake variables specific to the FreeBSD platform
+freebsd_cmake_vars = {
+    "HAVE_MALLOC_H": 1,
+    "HAVE_LINK_H": 1,
 }
 
 # CMake variables specific to the Darwin (Mac OS X) platform.
@@ -314,6 +322,21 @@ llvm_all_cmake_vars = select({
             win32_cmake_vars,
         ),
     ),
+    "@org_tensorflow//tensorflow:freebsd": cmake_var_string(
+        _dict_add(
+            cmake_vars,
+            llvm_target_cmake_vars("X86", "x86_64-unknown-freebsd"),
+            posix_cmake_vars,
+        ),
+    ),
+    "@org_tensorflow//tensorflow:linux_s390x": cmake_var_string(
+        _dict_add(
+            cmake_vars,
+            llvm_target_cmake_vars("SystemZ", "systemz-unknown-linux_gnu"),
+            posix_cmake_vars,
+            linux_cmake_vars,
+        ),
+    ),
     "//conditions:default": cmake_var_string(
         _dict_add(
             cmake_vars,
@@ -326,6 +349,7 @@ llvm_all_cmake_vars = select({
 
 llvm_linkopts = select({
     "@org_tensorflow//tensorflow:windows": [],
+    "@org_tensorflow//tensorflow:freebsd": ["-ldl", "-lm", "-lpthread", "-lexecinfo"],
     "//conditions:default": ["-ldl", "-lm", "-lpthread"],
 })
 
@@ -340,7 +364,7 @@ llvm_defines = select({
         "UNICODE",
         "_UNICODE",
     ],
-    "//conditions:default": ["_DEBUG"],
+    "//conditions:default": [],
 }) + [
     "LLVM_ENABLE_STATS",
     "__STDC_LIMIT_MACROS",

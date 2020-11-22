@@ -596,7 +596,7 @@ class Optimizer(
     with ops.init_scope():
       self._create_slots(var_list)
     update_ops = []
-    with ops.name_scope(name, self._name) as name:
+    with ops.name_scope(name, self._name, skip_on_eager=False) as name:
       self._prepare()
       for grad, var, processor in converted_grads_and_vars:
         if grad is None:
@@ -604,20 +604,23 @@ class Optimizer(
         # We colocate all ops created in _apply_dense or _apply_sparse
         # on the same device as the variable.
         # TODO(apassos): figure out how to get the variable name here.
-        if context.executing_eagerly() or isinstance(
-            var,
-            resource_variable_ops.ResourceVariable) and not var._in_graph_mode:  # pylint: disable=protected-access
+        if (context.executing_eagerly() or
+            resource_variable_ops.is_resource_variable(var)
+            and not var._in_graph_mode):  # pylint: disable=protected-access
           scope_name = ""
         else:
           scope_name = var.op.name
-        with ops.name_scope("update_" + scope_name), ops.colocate_with(var):
+        with ops.name_scope(
+            "update_" + scope_name,
+            skip_on_eager=False), ops.colocate_with(var):
           update_ops.append(processor.update_op(self, grad))
       if global_step is None:
         apply_updates = self._finish(update_ops, name)
       else:
         with ops.control_dependencies([self._finish(update_ops, "update")]):
           with ops.colocate_with(global_step):
-            if isinstance(global_step, resource_variable_ops.ResourceVariable):
+            if isinstance(
+                global_step, resource_variable_ops.BaseResourceVariable):
               # TODO(apassos): the implicit read in assign_add is slow; consider
               # making it less so.
               apply_updates = resource_variable_ops.assign_add_variable_op(
@@ -765,7 +768,7 @@ class Optimizer(
       # pylint: enable=protected-access
       mirrored_slot = named_slots.get(key, None)
       if mirrored_slot is None: return None
-      return mirrored_slot.get(device=var.device)
+      return mirrored_slot._get_on_device_or_primary()  # pylint: disable=protected-access
 
     return named_slots.get(_var_key(var), None)
 
@@ -821,7 +824,7 @@ class Optimizer(
       with distribution_strategy.extended.colocate_vars_with(colocate_with):
         if eager:
           restored_initial_value = self._preload_simple_restoration(
-              name=name, shape=None)
+              name=name)
           if restored_initial_value is not None:
             initial_value = restored_initial_value
         v = variable_scope.variable(
@@ -1210,11 +1213,15 @@ class Optimizer(
         # (aside from double initialization), and makes variable creator scopes
         # behave the same way they do when graph building.
         and not ops.get_default_graph()._variable_creator_stack):  # pylint: disable=protected-access
-      initializer = trackable.CheckpointInitialValue(
+      initializer = trackable.CheckpointInitialValueCallable(
           checkpoint_position=slot_variable_position)
-      slot_variable = self._get_or_make_slot(
+      # CheckpointInitialValueCallable will ignore the shape and dtype
+      # parameters but they must be passed.
+      slot_variable = self._get_or_make_slot_with_initializer(
           var=variable,
-          val=initializer,
+          initializer=initializer,
+          shape=variable.shape,
+          dtype=variable.dtype,
           slot_name=slot_name,
           op_name=self._name)
       # Slot variables are not owned by any one object (because we don't want to
